@@ -1,0 +1,290 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.constants import G, k, m_p
+from scipy.optimize import brentq
+import warnings
+warnings.filterwarnings('ignore')
+
+class ParkerWindSolver:
+    def __init__(self):
+        # Physical constants
+        self.M_sun = 1.9891e30  # kg   
+        self.R_sun = 6.96e8     # m          
+        self.T = 1e6            # K         
+        self.mu = 1             # mean molecular weight
+        
+        # Derived quantities
+        self.cs = np.sqrt(k * self.T / (self.mu * m_p))  # sound speed
+        self.rc = G * self.M_sun / (2 * self.cs**2)      # critical radius
+        
+        print(f"Sound speed: {self.cs/1e3:.2f} km/s")
+        print(f"Critical radius: {self.rc/self.R_sun:.2f} R_sun")
+    
+    def parker_ode(self, R, v):
+        """Dimensionless Parker wind ODE: dv/dR"""
+        if abs(v - 1.0) < 1e-10:  # Near critical point
+            return 1.0  # L'Hopital's rule limit
+        
+        numerator = 2 * (1/R - 1/R**2)
+        denominator = (v - 1/v)
+        return numerator / denominator
+    
+    def rk4_step(self, func, R, v, dR):
+        """Single RK4 integration step"""
+        k1 = dR * func(R, v)
+        k2 = dR * func(R + dR/2, v + k1/2)
+        k3 = dR * func(R + dR/2, v + k2/2)
+        k4 = dR * func(R + dR, v + k3)
+        return v + (k1 + 2*k2 + 2*k3 + k4) / 6
+    
+    def integrate_to_critical_point(self, R_start, v_start, n_steps=10000):
+        """
+        Integrate from boundary to critical point.
+        Returns (R_array, v_array, success_flag)
+        """
+        R_crit = 1.0  # Dimensionless critical radius
+        dR = (R_crit - R_start) / n_steps
+        
+        R_array = [R_start]
+        v_array = [v_start]
+        
+        R, v = R_start, v_start
+        
+        try:
+            for i in range(n_steps):
+                # Check for unphysical solutions
+                if v <= 0 or v > 10:  # Velocity bounds
+                    return R_array, v_array, False
+                
+                # Integration step
+                v_new = self.rk4_step(self.parker_ode, R, v, dR)
+                R_new = R + dR
+                
+                R_array.append(R_new)
+                v_array.append(v_new)
+                
+                R, v = R_new, v_new
+                
+                # Stop if we've reached critical point
+                if abs(R - R_crit) < abs(dR):
+                    break
+            
+            return R_array, v_array, True
+            
+        except (ZeroDivisionError, OverflowError):
+            return R_array, v_array, False
+    
+    def shooting_function(self, v_trial, R_boundary, target_v_crit=1.0):
+        """
+        Shooting function: returns difference between achieved and target 
+        velocity at critical point.
+        """
+        R_path, v_path, success = self.integrate_to_critical_point(R_boundary, v_trial)
+        
+        if not success or len(v_path) < 2:
+            return float('inf')  # Failed integration
+        
+        v_at_critical = v_path[-1]
+        return v_at_critical - target_v_crit
+    
+    def solve_boundary_value_problem(self, r0, rho0, v_guess_range=(0.001, 0.5)):
+        """
+        Solve Parker wind with boundary conditions at r0.
+        
+        Parameters:
+        - r0: boundary radius (m)
+        - rho0: boundary density (kg/m³)
+        - v_guess_range: range for initial velocity search (dimensionless)
+        
+        Returns:
+        - v0_correct: correct boundary velocity (m/s)
+        - solution: dict with full solution arrays
+        """
+        # Convert to dimensionless
+        R0 = r0 / self.rc
+        
+        print(f"\nSolving boundary value problem:")
+        print(f"Boundary radius: r0 = {r0/self.R_sun:.3f} R_sun")
+        print(f"Boundary density: ρ0 = {rho0/m_p:.2e} cm⁻³")
+        print(f"Dimensionless boundary radius: R0 = {R0:.4f}")
+        
+        # Check if boundary is inside critical radius
+        if R0 >= 1.0:
+            raise ValueError(f"Boundary radius R0 = {R0:.3f} >= 1. Must be inside critical radius.")
+        
+        # Define shooting function for this boundary
+        def shoot(v_trial_dimless):
+            return self.shooting_function(v_trial_dimless, R0)
+        
+        # Find velocity bounds where shooting function changes sign
+        v_low, v_high = v_guess_range
+        
+        # Expand search if needed
+        max_iterations = 20
+        for i in range(max_iterations):
+            try:
+                f_low = shoot(v_low)
+                f_high = shoot(v_high)
+                
+                if f_low * f_high < 0:  # Different signs - root exists
+                    break
+                elif abs(f_low) < abs(f_high):
+                    v_high = v_low + (v_high - v_low) * 2
+                else:
+                    v_low = v_low / 2
+                    
+            except:
+                v_low /= 2
+                v_high *= 1.5
+        
+        else:
+            raise RuntimeError("Could not find velocity bounds for root finding")
+        
+        print(f"Root finding bounds: v = [{v_low:.4f}, {v_high:.4f}] × cs")
+        
+        # Find the correct initial velocity
+        try:
+            v_correct_dimless = brentq(shoot, v_low, v_high, xtol=1e-8)
+        except ValueError as e:
+            raise RuntimeError(f"Root finding failed: {e}")
+        
+        # Convert back to dimensional units
+        v0_correct = v_correct_dimless * self.cs
+        
+        print(f"Converged solution:")
+        print(f"Correct boundary velocity: v0 = {v0_correct/1e3:.3f} km/s")
+        print(f"Dimensionless velocity: V0 = {v_correct_dimless:.4f}")
+        
+        # Generate full solution
+        R_sub, v_sub, success = self.integrate_to_critical_point(R0, v_correct_dimless, n_steps=5000)
+        
+        if not success:
+            raise RuntimeError("Failed to generate subsonic solution")
+        
+        # Generate supersonic solution from critical point
+        R_super, v_super = self.integrate_supersonic_branch(R_max=100, n_steps=5000)
+        
+        # Combine solutions
+        R_full = np.array(R_sub + R_super[1:])  # Avoid duplicating critical point
+        v_full = np.array(v_sub + v_super[1:])
+        
+        # Convert to dimensional units
+        r_full = R_full * self.rc
+        v_full_dim = v_full * self.cs
+        
+        # Calculate density profile using mass conservation
+        mass_flow_rate = rho0 * v0_correct * r0**2
+        rho_full = mass_flow_rate / (v_full_dim * r_full**2)
+        
+        solution = {
+            'r': r_full,
+            'v': v_full_dim,
+            'rho': rho_full,
+            'R_dimless': R_full,
+            'v_dimless': v_full,
+            'r_crit': self.rc,
+            'v_crit': self.cs,
+            'v0_correct': v0_correct,
+            'subsonic_points': len(R_sub),
+            'supersonic_points': len(R_super)
+        }
+        
+        return v0_correct, solution
+    
+    def integrate_supersonic_branch(self, R_max=100, n_steps=5000):
+        """Integrate supersonic branch from critical point outward"""
+        R_start = 1.0 + 1e-6  # Just past critical point
+        v_start = 1.0 + 1e-6
+        
+        dR = (R_max - R_start) / n_steps
+        
+        R_array = [1.0, R_start]  # Include exact critical point
+        v_array = [1.0, v_start]
+        
+        R, v = R_start, v_start
+        
+        for i in range(n_steps - 1):
+            v_new = self.rk4_step(self.parker_ode, R, v, dR)
+            R_new = R + dR
+            
+            R_array.append(R_new)
+            v_array.append(v_new)
+            
+            R, v = R_new, v_new
+        
+        return R_array, v_array
+    
+    def plot_solution(self, solution, v0_specified=None):
+        """Plot the Parker wind solution"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        
+        r_solar = solution['r'] / self.R_sun
+        
+        # Velocity plot
+        ax1.loglog(r_solar, solution['v']/1e3, 'b-', linewidth=2, label='Parker wind solution')
+        ax1.axvline(self.rc/self.R_sun, color='red', linestyle='--', alpha=0.7, label='Critical point')
+        ax1.axhline(self.cs/1e3, color='red', linestyle='--', alpha=0.7)
+        
+        # Mark boundary point
+        ax1.plot(1.0, solution['v0_correct']/1e3, 'go', markersize=8, label=f'Boundary: v₀ = {solution["v0_correct"]/1e3:.3f} km/s')
+        
+        if v0_specified:
+            ax1.plot(1.0, v0_specified/1e3, 'rx', markersize=10, label=f'Your specified: v₀ = {v0_specified/1e3:.1f} km/s')
+        
+        ax1.set_xlabel('r / R☉')
+        ax1.set_ylabel('Velocity (km/s)')
+        ax1.set_title('Parker Wind Velocity Profile')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        # Density plot
+        ax2.loglog(r_solar, solution['rho']/m_p, 'g-', linewidth=2, label='Density profile')
+        ax2.axvline(self.rc/self.R_sun, color='red', linestyle='--', alpha=0.7, label='Critical point')
+        
+        ax2.set_xlabel('r / R☉')
+        ax2.set_ylabel('Number density (cm⁻³)')
+        ax2.set_title('Parker Wind Density Profile')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print solution summary
+        print(f"\n=== SOLUTION SUMMARY ===")
+        print(f"Boundary conditions at r = {1.0} R☉:")
+        print(f"  Correct velocity: v₀ = {solution['v0_correct']/1e3:.3f} km/s")
+        print(f"  Density: ρ₀ = {solution['rho'][0]/m_p:.2e} cm⁻³")
+        print(f"Critical point at r = {self.rc/self.R_sun:.2f} R☉:")
+        print(f"  Velocity: v = {self.cs/1e3:.2f} km/s")
+        print(f"Solution points: {solution['subsonic_points']} subsonic, {solution['supersonic_points']} supersonic")
+
+# Example usage
+if __name__ == "__main__":
+    # Your original boundary conditions
+    r0 = 6.96e8  # 1 R_sun in meters
+    rho0 = 1e8 * m_p  # kg/m³
+    v0_specified = 1000  # m/s (your specified velocity)
+    
+    # Solve the boundary value problem
+    solver = ParkerWindSolver()
+    
+    try:
+        v0_correct, solution = solver.solve_boundary_value_problem(r0, rho0)
+        
+        print(f"\n=== COMPARISON WITH YOUR BOUNDARY CONDITIONS ===")
+        print(f"Your specified v₀: {v0_specified/1e3:.1f} km/s")
+        print(f"Parker-consistent v₀: {v0_correct/1e3:.3f} km/s")
+        print(f"Ratio: {v0_specified/v0_correct:.2f}")
+        
+        if abs(v0_specified - v0_correct) / v0_correct > 0.1:
+            print(f"⚠️  Your specified velocity differs by {abs(v0_specified - v0_correct)/v0_correct*100:.1f}%")
+            print("   from the Parker-consistent value.")
+        else:
+            print("✅ Your specified velocity is consistent with Parker wind!")
+        
+        # Plot the solution
+        solver.plot_solution(solution, v0_specified)
+        
+    except Exception as e:
+        print(f"Error: {e}")
